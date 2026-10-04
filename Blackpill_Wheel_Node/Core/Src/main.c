@@ -60,19 +60,24 @@
 //#define STATUS         0b01010
 //#define HEARTBEAT      0b11111
 
-#define MOTOR_DATA 0b00010
-#define SENSOR_DATA 0b00011
-#define SENSORS_CHECK 0b00001
+#define MOTOR_DATA 0b00000
+#define SENSOR_DATA 0b00001
+#define SENSORS_CHECK 0b00011
 
-#define HEARTBEAT 0b00000
+#define HEARTBEAT 0b00010 //ritvik sends
+#define HEARTBEATED 0b00110 //send back
 
-#define EXPLICIT_PWM 0b10001
-#define DRIVE_PWM 0b10010
-#define START_NODE 0b10000
+#define EXPLICIT_PWM 0b00111
+#define DRIVE_PWM 0b01000
+#define START_NODE 0b10100
 
 #define MAKE_ARBITRATION_ID(node, msg) (((node) << 5) | (msg))
 
 #define CAN_FAIL 10000
+#define LIMIT_DEBOUNCE_MS 15
+#define BUSOFF_CHECK_PERIOD_MS 200
+
+#define PWM_INTERRUPT 0b01010
 
 /* USER CODE END PD */
 
@@ -124,6 +129,7 @@ uCAN_MSG tx_sensor;
 uCAN_MSG tx_sensor_check;
 
 uCAN_MSG tx_heartbeat;
+uCAN_MSG tx_pwminterrupt;
 
 uCAN_MSG rx;
 
@@ -131,8 +137,11 @@ uint8_t timer = 0;
 static volatile uint32_t counter = 0;
 static volatile uint8_t heartbeater = 0;
 static volatile uint32_t CAN_failed_counter = 0;
+static uint32_t last_bussoff_check_tick = 0;
+static volatile uint32_t tx_drop_count = 0;
 volatile bool beat_pls = false;
 volatile bool start_node = false;
+volatile bool start_node_init = false;
 volatile bool CAN_checker = false;
 
 uint16_t nm[2];
@@ -171,6 +180,18 @@ uint16_t sensor_msg = MAKE_ARBITRATION_ID(FR, SENSOR_DATA);
 uint16_t sensor_check_msg = MAKE_ARBITRATION_ID(FR, SENSORS_CHECK);
 
 uint16_t heartbeat_msg = MAKE_ARBITRATION_ID(FR, HEARTBEAT);
+uint16_t heartbeated_msg = MAKE_ARBITRATION_ID(FR, HEARTBEATED);
+
+uint16_t pwminterrupted_msg = MAKE_ARBITRATION_ID(FR,PWM_INTERRUPT);
+
+volatile uint8_t interrupted_left = 0; //assume left has dir 0 so it goes past when pwm 0 (dir(c). Thus, dir 0 and interrupted_left must be logically 0. If if the dir is 1 then make it 1
+volatile uint8_t interrupted_right = 0;// assume right has dir 1 so for dir 1 and interrupted 1 pwm 0. If dir becomes 0 then let pwm to work.
+// when either of these happen cause interrupt, basically and both stuff for output (dir + intlc)*(dirc + intrc)
+
+static volatile uint32_t last_left_edge_tick = 0;
+static volatile uint32_t last_right_edge_tick = 0;
+static volatile bool left_edge_pending = false;
+static volatile bool right_edge_pending = false;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -239,7 +260,7 @@ void CAN_Send_MotorFrame(void){
     tx_motor.frame.data6 = adc_buf[1] & 0xFF;
     tx_motor.frame.data7 = (adc_buf[1] >> 8) & 0xFF; //drive current
 
-    CANSPI_Transmit(&tx_motor);
+    if (!CANSPI_Transmit(&tx_motor)) tx_drop_count++;
 
     tx_sensor.frame.idType = dSTANDARD_CAN_MSG_ID_2_0B;
     tx_sensor.frame.id = sensor_msg;
@@ -251,16 +272,16 @@ void CAN_Send_MotorFrame(void){
 	tx_sensor.frame.data3 = angvel[1];
 
 	//tx_sensor.frame.data2 = status_as; //LSB TO MSG
-    CANSPI_Transmit(&tx_sensor);
+    if (!CANSPI_Transmit(&tx_sensor)) tx_drop_count++;
 
-    if (beat_pls){
-		tx_heartbeat.frame.idType = dSTANDARD_CAN_MSG_ID_2_0B;
-		tx_heartbeat.frame.id = heartbeat_msg;
-		tx_heartbeat.frame.dlc = 1;
-		tx_heartbeat.frame.data0 = heartbeater;
-		beat_pls = false;
-		CANSPI_Transmit(&tx_heartbeat);
-    }
+//    if (beat_pls){
+//		tx_heartbeat.frame.idType = dSTANDARD_CAN_MSG_ID_2_0B;
+//		tx_heartbeat.frame.id = heartbeat_msg;
+//		tx_heartbeat.frame.dlc = 1;
+//		tx_heartbeat.frame.data0 = heartbeater;
+//		beat_pls = false;
+//		CANSPI_Transmit(&tx_heartbeat);
+//    }
 
 //    tx_imu.frame.idType = dSTANDARD_CAN_MSG_ID_2_0B;
 //    tx_imu.frame.id = imu_msg;
@@ -299,7 +320,7 @@ void CAN_Send_SensorCheck(void){
 	tx_sensor_check.frame.dlc = 2;
 	tx_sensor_check.frame.data0 = status_as;
 	tx_sensor_check.frame.data1 = status_bn;
-	CANSPI_Transmit(&tx_sensor_check);
+	if (!CANSPI_Transmit(&tx_sensor_check)) tx_drop_count++;
 }
 
 
@@ -325,6 +346,19 @@ void decode_id(uint16_t arb_id){
 	nm[1] = msg;
 }
 
+void CAN_Heartbeat(void){
+    if (beat_pls){
+		tx_heartbeat.frame.idType = dSTANDARD_CAN_MSG_ID_2_0B;
+		tx_heartbeat.frame.id = heartbeated_msg;
+		tx_heartbeat.frame.dlc = 1;
+		tx_heartbeat.frame.data0 = heartbeater & 0xFF;
+		tx_heartbeat.frame.data1 = (heartbeater >> 8) & 0xFF;
+		beat_pls = false;
+		if (!CANSPI_Transmit(&tx_heartbeat)) tx_drop_count++; //for debanson i will send 2 bytes
+    }
+}
+
+
 uint16_t cast_to_arbid(uint16_t id){
  return (id & 0b11111111111);
 }
@@ -332,6 +366,15 @@ uint16_t cast_to_arbid(uint16_t id){
 void delay_us (uint16_t us){
 	__HAL_TIM_SET_COUNTER(&htim1,0);  // set the counter value a 0
 	while (__HAL_TIM_GET_COUNTER(&htim1) < us);  // wait for the counter to reach the us input in the parameter
+}
+
+void CAN_PWMInterrupt(){
+	tx_pwminterrupt.frame.idType = dSTANDARD_CAN_MSG_ID_2_0B;
+	tx_pwminterrupt.frame.id = pwminterrupted_msg;
+	tx_pwminterrupt.frame.dlc = 2;
+	tx_pwminterrupt.frame.data0 = interrupted_left;
+	tx_pwminterrupt.frame.data1 = interrupted_right; //LSB is left limit switch MSB is right switch
+	if (!CANSPI_Transmit(&tx_pwminterrupt)) tx_drop_count++;
 }
 /* USER CODE END PFP */
 
@@ -427,6 +470,7 @@ int main(void)
 
   HAL_Delay(1000);
 
+  last_bussoff_check_tick = HAL_GetTick();
 
   /* USER CODE END 2 */
 
@@ -442,22 +486,44 @@ int main(void)
     	  I2C1_Sequence_Start();
       }
 
-      if (CAN_failed_counter>=10000){
+      if (CAN_failed_counter>=CAN_FAIL){
+    	  __HAL_TIM_SET_COMPARE(&htim5, TIM_CHANNEL_3, 0);
+    	  __HAL_TIM_SET_COMPARE(&htim5, TIM_CHANNEL_4, 0);
+    	  HAL_GPIO_WritePin(GPIOA,GPIO_PIN_4,0);
+    	  HAL_GPIO_WritePin(GPIOA,GPIO_PIN_5,0);
     	  start_node = false;
       }
 
-      if (!start_node){
-    	  while(!CANSPI_Receive(&rx)){}
-    	  if (rx.frame.id == start_node_msg){
-    		  start_node = true;
+      if (HAL_GetTick() - last_bussoff_check_tick >= BUSOFF_CHECK_PERIOD_MS){
+    	  last_bussoff_check_tick = HAL_GetTick();
+    	  if (CANSPI_isBussOff()){
+    		  CAN_checker = CANSPI_Initialize();
     	  }
-    	  else if (rx.frame.id == sensor_check_msg){
-    		  CAN_Send_SensorCheck();
-    	  }
-//    	  else{
+      }
+
+//      if (!start_node){
+//    	  HAL_Delay(500);
+//    	  HAL_GPIO_WritePin(GPIOC,GPIO_PIN_13,0);
+//    	  HAL_Delay(100);
+//    	  HAL_GPIO_WritePin(GPIOC,GPIO_PIN_13,1);
+//    	  HAL_Delay(100);
+//    	  while(!CANSPI_Receive(&rx)){}
+//    	  if (rx.frame.id == start_node_msg){
+//    		  HAL_GPIO_WritePin(GPIOC,GPIO_PIN_13,0);
+//    		  HAL_Delay(100);
+//    		  HAL_GPIO_WritePin(GPIOC,GPIO_PIN_13,1);
+//    		  HAL_Delay(100);
+//    		  start_node = true;
+//    		  start_node_init = true;
+//    		  delay_us(50);
+//    	  }
+//    	  else if (rx.frame.id == sensor_check_msg){
+//    		  CAN_Send_SensorCheck();
+//    	  }
+//    	  else if (start_node_init){
 //    		  start_node = true;
 //    	  }
-      }
+//      }
 
   	  if(timer==10){
   		  timer = 0;
@@ -468,34 +534,43 @@ int main(void)
   		  counter = 0;
   	  }
 
+  	  if (left_edge_pending && (HAL_GetTick() - last_left_edge_tick >= LIMIT_DEBOUNCE_MS)){
+  		  left_edge_pending = false;
+  		  CAN_PWMInterrupt();
+  	  }
+  	  if (right_edge_pending && (HAL_GetTick() - last_right_edge_tick >= LIMIT_DEBOUNCE_MS)){
+  		  right_edge_pending = false;
+  		  CAN_PWMInterrupt();
+  	  }
+
   	  if (s1 == HAL_OK && s2 == HAL_OK && s3 == HAL_OK && s4 == HAL_OK){
-  	      HAL_GPIO_WritePin(GPIOC, GPIO_PIN_14, 1); // I2C_debug
+  	      HAL_GPIO_WritePin(GPIOC, GPIO_PIN_15, 1); // I2C_debug
   	  }
   	  if (CAN_checker){
-  	      HAL_GPIO_WritePin(GPIOC, GPIO_PIN_15, 1); // SPI_debug
+  	      HAL_GPIO_WritePin(GPIOC, GPIO_PIN_14, 1); // SPI_debug
   	  }
 
   	  if (CANSPI_Receive(&rx)){
+  		  //getting pwm as 1st dir and 2nd pwm
   		  CAN_failed_counter=0;
   	      if (rx.frame.id == exp_pwm_msg){
   	          uint16_t pwm_exp = rx.frame.data1;
-  	          int dir = rx.frame.data0;
-  	          if (pwm_exp <= 255 && pwm_exp>=0){
-  	        	  HAL_GPIO_WritePin(GPIOA,GPIO_PIN_4,dir);
-  	        	  __HAL_TIM_SET_COMPARE(&htim5, TIM_CHANNEL_3, pwm_exp);
-  	          }
+  	          uint8_t dir = rx.frame.data0;
+  	          uint8_t blocked = (dir == 0) ? interrupted_left : interrupted_right;
+  	          HAL_GPIO_WritePin(GPIOA,GPIO_PIN_4,dir);
+  	          __HAL_TIM_SET_COMPARE(&htim5, TIM_CHANNEL_3, blocked ? 0 : pwm_exp);
   	      }
   	  	  else if (rx.frame.id == dr_pwm_msg){
   	          uint16_t pwm_dr = rx.frame.data1;
-  	          int dir = rx.frame.data0;
-  	          if (pwm_dr <= 255 && pwm_dr >= 0){
-  	        	HAL_GPIO_WritePin(GPIOA,GPIO_PIN_5,dir);
-  	        	  __HAL_TIM_SET_COMPARE(&htim5, TIM_CHANNEL_4, pwm_dr);
-  	          }
+  	          uint8_t dir = rx.frame.data0;
+  	          uint8_t blocked = (dir == 0) ? interrupted_left : interrupted_right;
+  	          HAL_GPIO_WritePin(GPIOA,GPIO_PIN_5,dir);
+  	          __HAL_TIM_SET_COMPARE(&htim5, TIM_CHANNEL_4, blocked ? 0 : pwm_dr);
   	      }
   	  	  else if (rx.frame.id == heartbeat_msg){
-  	  		  beat_pls = true;
   	  		  heartbeater = rx.frame.data0 + rx.frame.data1;
+  	  		  beat_pls = true;
+  	  		  CAN_Heartbeat();
   	  	  }
   	  }
 
@@ -507,6 +582,19 @@ int main(void)
   /* USER CODE END 3 */
 }
 
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin){
+	if (GPIO_Pin==GPIO_PIN_2){
+		interrupted_left = (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_2) == GPIO_PIN_SET) ? 1 : 0;
+		last_left_edge_tick = HAL_GetTick();
+		left_edge_pending = true;
+	}
+	else if(GPIO_Pin==GPIO_PIN_10){
+		interrupted_right = (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_10) == GPIO_PIN_SET) ? 1 : 0;
+		last_right_edge_tick = HAL_GetTick();
+		right_edge_pending = true;
+	}
+}
 /**
   * @brief System Clock Configuration
   * @retval None
@@ -852,7 +940,7 @@ static void MX_TIM5_Init(void)
   htim5.Instance = TIM5;
   htim5.Init.Prescaler = 71;
   htim5.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim5.Init.Period = 999;
+  htim5.Init.Period = 255;
   htim5.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim5.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim5) != HAL_OK)
@@ -956,6 +1044,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
+  /*Configure GPIO pins : PB2 PB10 */
+  GPIO_InitStruct.Pin = GPIO_PIN_2|GPIO_PIN_10;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
   /*Configure GPIO pins : CAN_CS_Pin IMU_RST_Pin */
   GPIO_InitStruct.Pin = CAN_CS_Pin|IMU_RST_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
@@ -968,6 +1062,13 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(IMU_INT_GPIO_Port, &GPIO_InitStruct);
+
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI2_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI2_IRQn);
+
+  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
 
 /* USER CODE BEGIN MX_GPIO_Init_2 */
 /* USER CODE END MX_GPIO_Init_2 */
